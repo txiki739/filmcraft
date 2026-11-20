@@ -377,8 +377,8 @@ impl MediaPool {
         Some(src)
     }
 
-    /// A copy of `item`'s file for a background job: the file opened again through the host's
-    /// reader, with decoders and decoded frames of its own, closed when the job drops it. None
+    /// A copy of `item`'s file for a background job: the file opened again through its path
+    /// opener or the host's reader, with its own decoder and frames, closed when the job drops it. None
     /// when the item shares the pool's source instead: not a file (a generator), made offline, an
     /// image sequence, a host without a reader (the browser), a format that would be read whole,
     /// or a file that does not open or that the pool last saw offline (the pool's source renders
@@ -390,9 +390,13 @@ impl MediaPool {
             return None;
         }
         let file = self.follow_media(path).ok()?;
-        let reader = services.reader(&file)?.ok()?;
-        let openers = self.openers.read().unwrap_or_else(PoisonError::into_inner).clone();
-        let src = filmcraft_media::reader::open_reader_within(&file_name(&file), reader, &filmcraft_codecs::reader_openers(), &openers, 0).ok()?;
+        let src = if let Some(result) = open_by_path(&file) {
+            result.ok()?
+        } else {
+            let reader = services.reader(&file)?.ok()?;
+            let openers = self.openers.read().unwrap_or_else(PoisonError::into_inner).clone();
+            filmcraft_media::reader::open_reader_within(&file_name(&file), reader, &filmcraft_codecs::reader_openers(), &openers, 0).ok()?
+        };
         Some(self.unsupported_as_slate(item, path, src))
     }
 
@@ -843,7 +847,7 @@ mod tests {
     }
 
     /// A path opener (a platform SDK that reads the file itself, such as Blackmagic RAW's) takes
-    /// its files before any reader or byte opener, on import and in Media Browser probes alike;
+    /// its files before any reader or byte opener on import, in Media Browser probes and in background jobs;
     /// other files never reach it.
     #[test]
     fn path_openers_take_their_files_before_the_readers() {
@@ -857,6 +861,14 @@ mod tests {
         assert!(pool.open_file("/clips/a.pathopenertest", &host).unwrap().info().has_audio());
         assert!(pool.probe_file("/clips/a.pathopenertest", &host).unwrap().info().has_audio());
         assert!(pool.open_file("/clips/a.mov", &host).is_err(), "other files still go through the host's reader");
+
+        // Export reopens the file for its own decoder. Only the path opener understands it.
+        let file = crate::media_test_util::tmp_dir("job-path-opener").join("a.pathopenertest");
+        std::fs::write(&file, b"not media").unwrap();
+        let mut session = crate::Session::default();
+        let item = crate::commands::import_streamed(&mut session, file.to_str().unwrap(), None).unwrap();
+        let source = session.media.own_source(&session.project, item, &host).expect("the background job opens its own path source");
+        assert!(source.info().has_audio());
     }
 
     /// A format only a platform path opener decodes (Blackmagic RAW), in a build where none is
